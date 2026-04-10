@@ -1,339 +1,261 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # =========================
-# Xray + Hysteria2 双协议安装脚本
+# Xray + Hysteria2 双协议安装脚本（增强完整版）
 # VLESS-Reality | Hysteria2
-# 最后更新时间: 2025.01.10
 # =========================
 
 export LANG=en_US.UTF-8
+set -u
+umask 077
 
-# 定义颜色
-red="\033[1;91m"
-green="\033[1;32m"
-yellow="\033[1;33m"
-purple="\033[1;35m"
-skyblue="\033[1;36m"
-re="\033[0m"
+# ---------- 颜色 ----------
+C_RED="\033[1;91m"
+C_GREEN="\033[1;32m"
+C_YELLOW="\033[1;33m"
+C_PURPLE="\033[1;35m"
+C_SKY="\033[1;36m"
+C_RESET="\033[0m"
 
-# 颜色输出函数
-red() { echo -e "${red}$1${re}"; }
-green() { echo -e "${green}$1${re}"; }
-yellow() { echo -e "${yellow}$1${re}"; }
-purple() { echo -e "${purple}$1${re}"; }
-skyblue() { echo -e "${skyblue}$1${re}"; }
+red()    { echo -e "${C_RED}$*${C_RESET}"; }
+green()  { echo -e "${C_GREEN}$*${C_RESET}"; }
+yellow() { echo -e "${C_YELLOW}$*${C_RESET}"; }
+purple() { echo -e "${C_PURPLE}$*${C_RESET}"; }
+sky()    { echo -e "${C_SKY}$*${C_RESET}"; }
+
 reading() {
-    local prompt="$1"
-    local varname="$2"
-    read -p "$(red "$prompt")" "$varname"
+  local prompt="$1" varname="$2"
+  read -r -p "$(red "$prompt")" "$varname"
 }
 
-# 定义常量
+die() {
+  red "错误: $*"
+  exit 1
+}
+
+# ---------- 常量 ----------
 XRAY_DIR="/etc/xray"
 HYSTERIA_DIR="/etc/hysteria2"
 CONFIG_DIR="${XRAY_DIR}/config.json"
 CLIENT_DIR="${XRAY_DIR}/urls.txt"
 WORK_DIR="/etc/proxy-scripts"
+INFO_FILE="${WORK_DIR}/info.conf"
 
-# 默认配置
 DEFAULT_REALITY_SNI="www.nvidia.com"
 VLESS_PORT=${PORT:-$(shuf -i 10000-50000 -n 1)}
 HY2_PORT=$((VLESS_PORT + 2))
 
-# =========================
-# 工具函数
-# =========================
+# 若设置了 SCRIPT_URL，会生成远程更新型 xr 命令；否则生成本地提示型 xr
+SCRIPT_URL="${SCRIPT_URL:-}"
 
-# 检查是否为root
+# ---------- 基础工具 ----------
 check_root() {
-    [[ $EUID -ne 0 ]] && red "请在root用户下运行脚本" && exit 1
+  [[ "${EUID}" -ne 0 ]] && die "请在 root 用户下运行"
 }
 
-# 检查命令是否存在
-command_exists() {
-    command -v "$1" >/dev/null 2>&1
-}
+command_exists() { command -v "$1" >/dev/null 2>&1; }
 
-# 检测系统类型
 detect_system() {
-    if [ -f /etc/debian_version ]; then
-        echo "debian"
-    elif [ -f /etc/redhat-release ]; then
-        echo "redhat"
-    elif [ -f /etc/alpine-release ]; then
-        echo "alpine"
-    else
-        echo "unknown"
-    fi
+  if [[ -f /etc/alpine-release ]]; then
+    echo "alpine"
+  elif [[ -f /etc/debian_version ]]; then
+    echo "debian"
+  elif [[ -f /etc/redhat-release ]]; then
+    echo "redhat"
+  else
+    echo "unknown"
+  fi
 }
 
-# 检测系统架构
 detect_arch() {
-    local ARCH_RAW=$(uname -m)
-    case "${ARCH_RAW}" in
-        'x86_64') echo 'amd64' ;;
-        'x86' | 'i686' | 'i386') echo '386' ;;
-        'aarch64' | 'arm64') echo 'arm64' ;;
-        'armv7l') echo 'armv7' ;;
-        's390x') echo 's390x' ;;
-        *) red "不支持的架构: ${ARCH_RAW}"; exit 1 ;;
-    esac
+  local raw
+  raw="$(uname -m)"
+  case "$raw" in
+    x86_64) echo "amd64" ;;
+    i386|i686|x86) echo "386" ;;
+    aarch64|arm64) echo "arm64" ;;
+    armv7l) echo "armv7" ;;
+    s390x) echo "s390x" ;;
+    *) die "不支持的架构: $raw" ;;
+  esac
 }
 
-# 获取最新版本
-get_latest_version() {
-    local repo=$1
-    curl -s "https://api.github.com/repos/${repo}/releases/latest" | jq -r '.tag_name | sub("^v"; "")'
-}
-
-# 包管理函数
 manage_packages() {
-    local action=$1
-    shift
-
-    for package in "$@"; do
-        if [ "$action" == "install" ]; then
-            if command_exists "$package"; then
-                green "${package} 已安装"
-                continue
-            fi
-            yellow "正在安装 ${package}..."
-            if command_exists apt; then
-                DEBIAN_FRONTEND=noninteractive apt update >/dev/null 2>&1
-                DEBIAN_FRONTEND=noninteractive apt install -y "$package" >/dev/null 2>&1
-            elif command_exists apk; then
-                apk update >/dev/null 2>&1
-                apk add "$package" >/dev/null 2>&1
-            elif command_exists yum; then
-                yum install -y "$package" >/dev/null 2>&1
-            elif command_exists dnf; then
-                dnf install -y "$package" >/dev/null 2>&1
-            else
-                red "无法安装 ${package}，未知的包管理器"
-                return 1
-            fi
-        elif [ "$action" == "uninstall" ]; then
-            if ! command_exists "$package"; then
-                yellow "${package} 未安装"
-                continue
-            fi
-            yellow "正在卸载 ${package}..."
-            if command_exists apt; then
-                apt remove -y "$package" >/dev/null 2>&1
-            elif command_exists apk; then
-                apk del "$package" >/dev/null 2>&1
-            elif command_exists yum; then
-                yum remove -y "$package" >/dev/null 2>&1
-            elif command_exists dnf; then
-                dnf remove -y "$package" >/dev/null 2>&1
-            fi
-        fi
-    done
+  local action="$1"; shift
+  local pkg
+  for pkg in "$@"; do
+    if [[ "$action" == "install" ]]; then
+      if command_exists "$pkg"; then
+        green "$pkg 已安装"
+        continue
+      fi
+      yellow "正在安装: $pkg"
+      if command_exists apt; then
+        DEBIAN_FRONTEND=noninteractive apt update -y >/dev/null 2>&1 || true
+        DEBIAN_FRONTEND=noninteractive apt install -y "$pkg" >/dev/null 2>&1 || die "安装 $pkg 失败"
+      elif command_exists apk; then
+        apk update >/dev/null 2>&1 || true
+        apk add "$pkg" >/dev/null 2>&1 || die "安装 $pkg 失败"
+      elif command_exists dnf; then
+        dnf install -y "$pkg" >/dev/null 2>&1 || die "安装 $pkg 失败"
+      elif command_exists yum; then
+        yum install -y "$pkg" >/dev/null 2>&1 || die "安装 $pkg 失败"
+      else
+        die "未知包管理器，无法安装 $pkg"
+      fi
+    fi
+  done
 }
 
-# 防火墙端口放行
+ensure_dirs() {
+  mkdir -p "$XRAY_DIR" "$HYSTERIA_DIR" "$WORK_DIR"
+}
+
+get_latest_version_no_v() {
+  local repo="$1"
+  curl -fsSL "https://api.github.com/repos/${repo}/releases/latest" | jq -r '.tag_name|sub("^v";"")'
+}
+
+get_latest_tag_raw() {
+  local repo="$1"
+  curl -fsSL "https://api.github.com/repos/${repo}/releases/latest" | jq -r '.tag_name'
+}
+
+port_in_use() {
+  local p="$1"
+  if command_exists ss; then
+    ss -lntup 2>/dev/null | grep -qE "[\:\.]${p}\b"
+  elif command_exists netstat; then
+    netstat -lntup 2>/dev/null | grep -qE "[\:\.]${p}\b"
+  else
+    return 1
+  fi
+}
+
 allow_port() {
-    for rule in "$@"; do
-        local port=${rule%/*}
-        local proto=${rule#*/}
+  local rule port proto
+  for rule in "$@"; do
+    port="${rule%/*}"
+    proto="${rule#*/}"
 
-        # ufw
-        if command_exists ufw; then
-            ufw allow ${port}/${proto} >/dev/null 2>&1
-        fi
+    command_exists ufw && ufw allow "${port}/${proto}" >/dev/null 2>&1 || true
 
-        # firewalld
-        if command_exists firewall-cmd; then
-            systemctl is-active firewalld >/dev/null 2>&1 && \
-                firewall-cmd --permanent --add-port=${port}/${proto} >/dev/null 2>&1 && \
-                firewall-cmd --reload >/dev/null 2>&1
-        fi
-
-        # iptables
-        if command_exists iptables; then
-            iptables -C INPUT -p ${proto} --dport ${port} -j ACCEPT >/dev/null 2>&1 || \
-                iptables -I INPUT -p ${proto} --dport ${port} -j ACCEPT >/dev/null 2>&1
-        fi
-
-        # ip6tables
-        if command_exists ip6tables; then
-            ip6tables -C INPUT -p ${proto} --dport ${port} -j ACCEPT >/dev/null 2>&1 || \
-                ip6tables -I INPUT -p ${proto} --dport ${port} -j ACCEPT >/dev/null 2>&1
-        fi
-    done
-
-    # 保存规则
-    if command_exists netfilter-persistent; then
-        netfilter-persistent save >/dev/null 2>&1
-    elif [ -f /etc/init.d/iptables ]; then
-        /etc/init.d/iptables save >/dev/null 2>&1
+    if command_exists firewall-cmd && command_exists systemctl; then
+      if systemctl is-active firewalld >/dev/null 2>&1; then
+        firewall-cmd --permanent --add-port="${port}/${proto}" >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+      fi
     fi
+
+    command_exists iptables  && (iptables  -C INPUT -p "$proto" --dport "$port" -j ACCEPT >/dev/null 2>&1 || iptables  -I INPUT -p "$proto" --dport "$port" -j ACCEPT >/dev/null 2>&1) || true
+    command_exists ip6tables && (ip6tables -C INPUT -p "$proto" --dport "$port" -j ACCEPT >/dev/null 2>&1 || ip6tables -I INPUT -p "$proto" --dport "$port" -j ACCEPT >/dev/null 2>&1) || true
+  done
+
+  command_exists netfilter-persistent && netfilter-persistent save >/dev/null 2>&1 || true
+  [[ -f /etc/init.d/iptables ]] && /etc/init.d/iptables save >/dev/null 2>&1 || true
 }
 
-# 获取真实IP
 get_realip() {
-    local ip=$(curl -4 -sm 2 ip.sb 2>/dev/null)
-    local get_ipv6=$(curl -6 -sm 2 ip.sb 2>/dev/null)
+  local ipv4 ipv6
+  ipv4="$(curl -4 -fsS --max-time 4 https://api.ipify.org 2>/dev/null || true)"
+  [[ -z "$ipv4" ]] && ipv4="$(curl -4 -fsS --max-time 4 https://ip.sb 2>/dev/null || true)"
+  [[ -z "$ipv4" ]] && ipv4="$(curl -4 -fsS --max-time 4 https://ifconfig.me 2>/dev/null || true)"
 
-    if [ -z "$ip" ]; then
-        echo "[${get_ipv6}]"
-    elif curl -4 -sm 2 http://ipinfo.io/org 2>/dev/null | grep -qE 'Cloudflare|UnReal|AEZA|Andrei'; then
-        echo "[${get_ipv6}]"
-    else
-        echo "$ip"
-    fi
+  ipv6="$(curl -6 -fsS --max-time 4 https://api64.ipify.org 2>/dev/null || true)"
+  [[ -z "$ipv6" ]] && ipv6="$(curl -6 -fsS --max-time 4 https://ip.sb 2>/dev/null || true)"
+
+  if [[ -n "$ipv4" ]]; then
+    echo "$ipv4"
+  elif [[ -n "$ipv6" ]]; then
+    echo "[$ipv6]"
+  else
+    hostname -I 2>/dev/null | awk '{print $1}'
+  fi
 }
 
-# 生成随机UUID
 generate_uuid() {
-    if command_exists uuidgen; then
-        uuidgen
-    else
-        cat /proc/sys/kernel/random/uuid 2>/dev/null || \
-        cat /dev/urandom | tr -dc 'a-f0-9' | fold -w 8 | head -n 1 | \
-        xargs -I {} echo "{}$(cat /dev/urandom | tr -dc 'a-f0-9' | fold -w 4 | head -n 1)-$(cat /dev/urandom | tr -dc 'a-f0-9' | fold -w 4 | head -n 1)-$(cat /dev/urandom | tr -dc 'a-f0-9' | fold -w 4 | head -n 1)-$(cat /dev/urandom | tr -dc 'a-f0-9' | fold -w 12 | head -n 1)"
-    fi
+  if command_exists uuidgen; then
+    uuidgen
+  elif [[ -r /proc/sys/kernel/random/uuid ]]; then
+    cat /proc/sys/kernel/random/uuid
+  else
+    cat /dev/urandom | tr -dc 'a-f0-9' | head -c 32 | sed -E 's/(.{8})(.{4})(.{4})(.{4})(.{12})/\1-\2-\3-\4-\5/'
+  fi
 }
 
-# 生成随机密码
-generate_password() {
-    tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 24
+generate_password() { tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 24; }
+
+extract_x25519_keys() {
+  local out="$1" pri pub
+  pri="$(echo "$out" | sed -nE 's/.*Private[[:space:]_]?Key:[[:space:]]*([A-Za-z0-9+\/=_-]+).*/\1/p' | head -n1)"
+  pub="$(echo "$out" | sed -nE 's/.*Public[[:space:]_]?Key:[[:space:]]*([A-Za-z0-9+\/=_-]+).*/\1/p' | head -n1)"
+
+  [[ -z "$pri" ]] && pri="$(echo "$out" | awk '/Private key:/ {print $3}' | head -n1)"
+  [[ -z "$pub" ]] && pub="$(echo "$out" | awk '/Public key:/ {print $3}' | head -n1)"
+  [[ -z "$pub" ]] && pub="$(echo "$out" | awk '/Password:/ {print $2}' | head -n1)"
+
+  [[ -n "$pri" && -n "$pub" ]] || return 1
+  echo "${pri}|${pub}"
 }
 
-# =========================
-# Xray 安装
-# =========================
-
+# ---------- 安装 ----------
 install_xray() {
-    clear
-    purple "正在安装 Xray..."
+  purple "正在安装 Xray..."
+  local arch ver url
+  arch="$(detect_arch)"
+  ver="$(get_latest_version_no_v "XTLS/Xray-core")"
+  [[ -n "$ver" && "$ver" != "null" ]] || die "获取 Xray 版本失败"
 
-    local ARCH=$(detect_arch)
-    local SYSTEM=$(detect_system)
-    local XRAY_VERSION=$(get_latest_version "XTLS/Xray-core")
+  ensure_dirs
 
-    # 创建目录
-    mkdir -p "${XRAY_DIR}"
-    mkdir -p "${WORK_DIR}"
+  case "$arch" in
+    amd64) url="https://github.com/XTLS/Xray-core/releases/download/v${ver}/Xray-linux-64.zip" ;;
+    arm64) url="https://github.com/XTLS/Xray-core/releases/download/v${ver}/Xray-linux-arm64-v8a.zip" ;;
+    armv7) url="https://github.com/XTLS/Xray-core/releases/download/v${ver}/Xray-linux-arm32-v7a.zip" ;;
+    386)   url="https://github.com/XTLS/Xray-core/releases/download/v${ver}/Xray-linux-32.zip" ;;
+    *) die "Xray 暂不支持架构: $arch" ;;
+  esac
 
-    # 下载 Xray
-    yellow "下载 Xray-core v${XRAY_VERSION} (${ARCH})..."
-    local XRAY_URL="https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}/Xray-linux-64.zip"
+  cd /tmp || die "无法进入 /tmp"
+  rm -f Xray.zip
+  curl -fL --retry 3 -o Xray.zip "$url" || die "下载 Xray 失败"
+  unzip -o Xray.zip -d "$XRAY_DIR" xray geosite.dat geoip.dat >/dev/null || die "解压 Xray 失败"
+  chmod +x "${XRAY_DIR}/xray"
+  rm -f Xray.zip
 
-    if [ "$ARCH" == "arm64" ]; then
-        XRAY_URL="https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}/Xray-linux-arm64-v8a.zip"
-    elif [ "$ARCH" == "armv7" ]; then
-        XRAY_URL="https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}/Xray-linux-arm32-v7a.zip"
-    elif [ "$ARCH" == "386" ]; then
-        XRAY_URL="https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}/Xray-linux-32.zip"
-    fi
-
-    cd /tmp
-    rm -f Xray-*.zip
-    curl -L -o Xray.zip "${XRAY_URL}"
-    unzip -o Xray.zip -d "${XRAY_DIR}" xray geosite.dat geoip.dat
-    chmod +x ${XRAY_DIR}/xray
-    rm -f Xray.zip
-
-    green "Xray 安装完成"
+  "${XRAY_DIR}/xray" version >/dev/null 2>&1 || die "Xray 二进制不可执行"
+  green "Xray 安装完成"
 }
-
-# =========================
-# Hysteria2 安装
-# =========================
 
 install_hysteria2() {
-    clear
-    purple "正在安装 Hysteria2..."
+  purple "正在安装 Hysteria2..."
+  local arch ver arch_file url
+  arch="$(detect_arch)"
+  ver="$(get_latest_tag_raw "apernet/hysteria")"
+  [[ -n "$ver" && "$ver" != "null" ]] || die "获取 Hysteria2 版本失败"
 
-    local ARCH=$(detect_arch)
-    # Hysteria 仓库地址和文件名
-    local HY2_VERSION=$(curl -s "https://api.github.com/repos/apernet/hysteria/releases/latest" | jq -r '.tag_name')
+  ensure_dirs
 
-    # 创建目录
-    mkdir -p "${HYSTERIA_DIR}"
+  case "$arch" in
+    amd64) arch_file="linux-amd64" ;;
+    arm64) arch_file="linux-arm64" ;;
+    armv7) arch_file="linux-arm" ;;
+    386)   arch_file="linux-386" ;;
+    *) die "Hysteria2 暂不支持架构: $arch" ;;
+  esac
 
-    # 下载 Hysteria2
-    yellow "下载 Hysteria2 ${HY2_VERSION} (${ARCH})..."
+  url="https://github.com/apernet/hysteria/releases/download/${ver}/hysteria-${arch_file}"
+  curl -fL --retry 3 -o "${HYSTERIA_DIR}/hysteria2" "$url" || die "下载 Hysteria2 失败"
+  chmod +x "${HYSTERIA_DIR}/hysteria2"
 
-    # 根据架构选择正确的文件名
-    local arch_file="linux-amd64"
-    if [ "$ARCH" == "arm64" ]; then
-        arch_file="linux-arm64"
-    elif [ "$ARCH" == "armv7" ]; then
-        arch_file="linux-arm"
-    elif [ "$ARCH" == "386" ]; then
-        arch_file="linux-386"
-    fi
-
-    # Hysteria 使用 hysteria-xxx 文件名
-    local HY2_URL="https://github.com/apernet/hysteria/releases/download/${HY2_VERSION}/hysteria-${arch_file}"
-
-    curl -L -o "${HYSTERIA_DIR}/hysteria2" "${HY2_URL}"
-    chmod +x ${HYSTERIA_DIR}/hysteria2
-
-    green "Hysteria2 安装完成"
+  "${HYSTERIA_DIR}/hysteria2" version >/dev/null 2>&1 || die "Hysteria2 二进制不可执行"
+  green "Hysteria2 安装完成"
 }
 
-# =========================
-# 配置生成
-# =========================
-
-generate_config() {
-    purple "正在生成配置..."
-
-    # 生成认证信息
-    local UUID=$(generate_uuid)
-    local PASSWORD=$(generate_password)
-
-    # 生成 Reality 密钥对
-    # 注意：Xray x25519 输出中 Password 字段就是客户端需要的 PublicKey
-    local output=$(${XRAY_DIR}/xray x25519)
-    local PRIVATE_KEY=$(echo "${output}" | awk '/PrivateKey:/ {print $2}')
-    local PUBLIC_KEY=$(echo "${output}" | awk '/Password:/ {print $2}')
-
-    # 生成自签名证书（用于 Hysteria2）
-    openssl ecparam -genkey -name prime256v1 -out "${HYSTERIA_DIR}/private.key" 2>/dev/null
-    openssl req -new -x509 -days 3650 -key "${HYSTERIA_DIR}/private.key" \
-        -out "${HYSTERIA_DIR}/cert.pem" -subj "/CN=www.nvidia.com" 2>/dev/null
-
-    # 检测网络类型
-    local dns_strategy="prefer_ipv4"
-    if ping -c 1 -W 3 8.8.8.8 >/dev/null 2>&1; then
-        dns_strategy="prefer_ipv4"
-    elif ping -c 1 -W 3 2001:4860:4860::8888 >/dev/null 2>&1; then
-        dns_strategy="prefer_ipv6"
-    fi
-
-    # 保存配置信息
-    cat > "${WORK_DIR}/info.conf" << EOF
-UUID=${UUID}
-PASSWORD=${PASSWORD}
-PRIVATE_KEY=${PRIVATE_KEY}
-PUBLIC_KEY=${PUBLIC_KEY}
-VLESS_PORT=${VLESS_PORT}
-HY2_PORT=${HY2_PORT}
-REALITY_SNI=${DEFAULT_REALITY_SNI}
-EOF
-
-    chmod 600 "${WORK_DIR}/info.conf"
-
-    # 生成 Xray 配置
-    generate_xray_config "$UUID" "$PRIVATE_KEY" "$dns_strategy"
-
-    # 生成 Hysteria2 配置
-    generate_hysteria2_config "$PASSWORD"
-
-    green "配置生成完成"
-}
-
-# 生成 Xray 配置文件
+# ---------- 配置 ----------
 generate_xray_config() {
-    local uuid=$1
-    local private_key=$2
-    local dns_strategy=$3
-
-    cat > "${CONFIG_DIR}" << EOF
+  local uuid="$1" private_key="$2" dns_strategy="$3" sni="$4"
+  cat > "${CONFIG_DIR}" <<EOF
 {
   "log": {
     "disabled": false,
@@ -367,10 +289,8 @@ generate_xray_config() {
         "network": "tcp",
         "security": "reality",
         "realitySettings": {
-          "dest": "${DEFAULT_REALITY_SNI}:443",
-          "serverNames": [
-            "${DEFAULT_REALITY_SNI}"
-          ],
+          "dest": "${sni}:443",
+          "serverNames": ["${sni}"],
           "privateKey": "${private_key}",
           "shortIds": [""]
         }
@@ -379,39 +299,16 @@ generate_xray_config() {
     }
   ],
   "outbounds": [
-    {
-      "tag": "direct",
-      "protocol": "freedom"
-    },
-    {
-      "tag": "block",
-      "protocol": "blackhole"
-    }
-  ],
-  "route": {
-    "domainStrategy": "AsIs",
-    "rules": [
-      {
-        "type": "field",
-        "inboundTag": ["vless-reality"],
-        "outboundTag": "direct"
-      },
-      {
-        "type": "field",
-        "port": "0-65535",
-        "outboundTag": "direct"
-      }
-    ]
-  }
+    { "tag": "direct", "protocol": "freedom" },
+    { "tag": "block", "protocol": "blackhole" }
+  ]
 }
 EOF
 }
 
-# 生成 Hysteria2 配置文件
 generate_hysteria2_config() {
-    local password=$1
-
-    cat > "${HYSTERIA_DIR}/config.yaml" << EOF
+  local password="$1" sni="$2"
+  cat > "${HYSTERIA_DIR}/config.yaml" <<EOF
 listen: :${HY2_PORT}
 
 tls:
@@ -434,45 +331,86 @@ quic:
 masquerade:
   type: proxy
   proxy:
-    url: https://www.nvidia.com
+    url: https://${sni}
     rewriteHost: true
 
 bandwidth:
   up: 1 gbps
   down: 1 gbps
-
-socks5:
-  enabled: false
 EOF
 }
 
-# =========================
-# 服务管理
-# =========================
+save_info() {
+  cat > "${INFO_FILE}" <<EOF
+UUID=$1
+PASSWORD=$2
+PRIVATE_KEY=$3
+PUBLIC_KEY=$4
+VLESS_PORT=$5
+HY2_PORT=$6
+REALITY_SNI=$7
+EOF
+  chmod 600 "${INFO_FILE}"
+}
 
+load_info() {
+  [[ -f "${INFO_FILE}" ]] || return 1
+  # shellcheck disable=SC1090
+  source "${INFO_FILE}"
+  return 0
+}
+
+generate_config() {
+  purple "正在生成配置..."
+  ensure_dirs
+
+  local UUID PASSWORD output pair PRIVATE_KEY PUBLIC_KEY dns_strategy sni
+  UUID="$(generate_uuid)"
+  PASSWORD="$(generate_password)"
+  sni="${DEFAULT_REALITY_SNI}"
+
+  output="$("${XRAY_DIR}/xray" x25519 2>/dev/null || true)"
+  pair="$(extract_x25519_keys "$output" || true)"
+  [[ -n "$pair" ]] || die "Reality 密钥生成失败，x25519 输出异常: ${output}"
+
+  PRIVATE_KEY="${pair%%|*}"
+  PUBLIC_KEY="${pair##*|}"
+
+  openssl ecparam -genkey -name prime256v1 -out "${HYSTERIA_DIR}/private.key" >/dev/null 2>&1 || die "生成证书私钥失败"
+  openssl req -new -x509 -days 3650 -key "${HYSTERIA_DIR}/private.key" -out "${HYSTERIA_DIR}/cert.pem" -subj "/CN=${sni}" >/dev/null 2>&1 || die "生成证书失败"
+
+  dns_strategy="prefer_ipv4"
+  ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1 && dns_strategy="prefer_ipv4"
+  ping -6 -c 1 -W 2 2001:4860:4860::8888 >/dev/null 2>&1 && [[ "$dns_strategy" != "prefer_ipv4" ]] && dns_strategy="prefer_ipv6"
+
+  generate_xray_config "$UUID" "$PRIVATE_KEY" "$dns_strategy" "$sni"
+  generate_hysteria2_config "$PASSWORD" "$sni"
+  save_info "$UUID" "$PASSWORD" "$PRIVATE_KEY" "$PUBLIC_KEY" "$VLESS_PORT" "$HY2_PORT" "$sni"
+
+  "${XRAY_DIR}/xray" run -test -config "${CONFIG_DIR}" >/dev/null 2>&1 || die "Xray 配置校验失败"
+  "${HYSTERIA_DIR}/hysteria2" server -c "${HYSTERIA_DIR}/config.yaml" --check >/dev/null 2>&1 || die "Hysteria2 配置校验失败"
+
+  green "配置生成完成"
+}
+
+# ---------- 服务 ----------
 create_xray_service() {
-    local SYSTEM=$(detect_system)
-
-    if [ "$SYSTEM" == "alpine" ]; then
-        # OpenRC 服务
-        cat > /etc/init.d/xray << EOF
+  local system
+  system="$(detect_system)"
+  if [[ "$system" == "alpine" ]]; then
+    cat > /etc/init.d/xray <<EOF
 #!/sbin/openrc-run
-
 description="Xray Service"
 command="${XRAY_DIR}/xray"
 command_args="run -config ${CONFIG_DIR}"
 command_background=true
 pidfile="/run/xray.pid"
-depend() {
-    need net
-    after firewall
-}
+depend() { need net; }
 EOF
-        chmod +x /etc/init.d/xray
-        rc-update add xray default >/dev/null 2>&1
-    else
-        # systemd 服务
-        cat > /etc/systemd/system/xray.service << EOF
+    chmod +x /etc/init.d/xray
+    rc-update add xray default >/dev/null 2>&1 || true
+  else
+    cat > /etc/systemd/system/xray.service <<EOF
 [Unit]
 Description=Xray Service
 After=network.target nss-lookup.target
@@ -482,40 +420,34 @@ Type=simple
 User=root
 ExecStart=${XRAY_DIR}/xray run -config ${CONFIG_DIR}
 Restart=on-failure
-RestartSec=10
-LimitNOFILE=infinity
+RestartSec=5
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
 EOF
-        systemctl daemon-reload
-        systemctl enable xray >/dev/null 2>&1
-    fi
+    systemctl daemon-reload
+    systemctl enable xray >/dev/null 2>&1 || true
+  fi
 }
 
 create_hysteria2_service() {
-    local SYSTEM=$(detect_system)
-
-    if [ "$SYSTEM" == "alpine" ]; then
-        # OpenRC 服务
-        cat > /etc/init.d/hysteria2 << EOF
+  local system
+  system="$(detect_system)"
+  if [[ "$system" == "alpine" ]]; then
+    cat > /etc/init.d/hysteria2 <<EOF
 #!/sbin/openrc-run
-
 description="Hysteria2 Service"
 command="${HYSTERIA_DIR}/hysteria2"
 command_args="server -c ${HYSTERIA_DIR}/config.yaml"
 command_background=true
 pidfile="/run/hysteria2.pid"
-depend() {
-    need net
-    after firewall
-}
+depend() { need net; }
 EOF
-        chmod +x /etc/init.d/hysteria2
-        rc-update add hysteria2 default >/dev/null 2>&1
-    else
-        # systemd 服务
-        cat > /etc/systemd/system/hysteria2.service << EOF
+    chmod +x /etc/init.d/hysteria2
+    rc-update add hysteria2 default >/dev/null 2>&1 || true
+  else
+    cat > /etc/systemd/system/hysteria2.service <<EOF
 [Unit]
 Description=Hysteria2 Service
 After=network.target nss-lookup.target
@@ -525,107 +457,72 @@ Type=simple
 User=root
 ExecStart=${HYSTERIA_DIR}/hysteria2 server -c ${HYSTERIA_DIR}/config.yaml
 Restart=on-failure
-RestartSec=10
-LimitNOFILE=infinity
+RestartSec=5
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
 EOF
-        systemctl daemon-reload
-        systemctl enable hysteria2 >/dev/null 2>&1
-    fi
+    systemctl daemon-reload
+    systemctl enable hysteria2 >/dev/null 2>&1 || true
+  fi
 }
 
-# 通用服务管理
 manage_service() {
-    local service_name=$1
-    local action=$2
-    local SYSTEM=$(detect_system)
-
-    case "$action" in
-        start)
-            if [ "$SYSTEM" == "alpine" ]; then
-                rc-service ${service_name} start
-            else
-                systemctl start ${service_name}
-            fi
-            ;;
-        stop)
-            if [ "$SYSTEM" == "alpine" ]; then
-                rc-service ${service_name} stop
-            else
-                systemctl stop ${service_name}
-            fi
-            ;;
-        restart)
-            if [ "$SYSTEM" == "alpine" ]; then
-                rc-service ${service_name} restart
-            else
-                systemctl restart ${service_name}
-            fi
-            ;;
-        status)
-            if [ "$SYSTEM" == "alpine" ]; then
-                rc-service ${service_name} status 2>&1 | grep -q "started" && echo "running" || echo "not running"
-            else
-                systemctl is-active ${service_name} 2>&1 | grep -q "^active$" && echo "running" || echo "not running"
-            fi
-            ;;
-    esac
+  local name="$1" action="$2" system
+  system="$(detect_system)"
+  case "$action" in
+    start|stop|restart)
+      if [[ "$system" == "alpine" ]]; then
+        rc-service "$name" "$action"
+      else
+        systemctl "$action" "$name"
+      fi
+      ;;
+    status)
+      if [[ "$system" == "alpine" ]]; then
+        rc-service "$name" status 2>&1 | grep -q "started" && echo "running" || echo "not running"
+      else
+        systemctl is-active "$name" >/dev/null 2>&1 && echo "running" || echo "not running"
+      fi
+      ;;
+  esac
 }
-
-# =========================
-# 时间同步
-# =========================
 
 setup_time_sync() {
-    purple "配置时间同步..."
-
-    local SYSTEM=$(detect_system)
-
-    if [ "$SYSTEM" == "alpine" ]; then
-        apk add chrony >/dev/null 2>&1
-        rc-update add chronyd default >/dev/null 2>&1
-        rc-service chronyd start >/dev/null 2>&1
-    else
-        manage_packages install chrony >/dev/null 2>&1
-        systemctl enable chronyd >/dev/null 2>&1
-        systemctl start chronyd >/dev/null 2>&1
-    fi
-
-    green "时间同步配置完成"
+  purple "配置时间同步..."
+  local system
+  system="$(detect_system)"
+  if [[ "$system" == "alpine" ]]; then
+    manage_packages install chrony
+    rc-update add chronyd default >/dev/null 2>&1 || true
+    rc-service chronyd start >/dev/null 2>&1 || true
+  else
+    manage_packages install chrony
+    systemctl enable chronyd >/dev/null 2>&1 || true
+    systemctl start chronyd >/dev/null 2>&1 || true
+  fi
+  green "时间同步配置完成"
 }
 
-# =========================
-# 节点信息生成
-# =========================
-
+# ---------- 链接 ----------
 generate_urls() {
-    purple "正在生成节点链接..."
+  purple "正在生成节点链接..."
+  load_info || die "配置文件不存在"
 
-    # 读取配置
-    if [ -f "${WORK_DIR}/info.conf" ]; then
-        source "${WORK_DIR}/info.conf"
-    else
-        red "配置文件不存在"
-        return 1
-    fi
+  local server_ip isp sni
+  server_ip="$(get_realip)"
+  [[ -n "$server_ip" ]] || server_ip="0.0.0.0"
 
-    # 获取服务器IP
-    local SERVER_IP=$(get_realip)
-    local ISP=$(curl -s --max-time 2 https://ipapi.co/json 2>/dev/null | \
-        tr -d '\n[:space:]' | \
-        sed 's/.*"country_code":"\([^"]*\)".*"org":"\([^"]*\)".*/\1-\2/' | \
-        sed 's/ /_/g' 2>/dev/null || echo "VPS")
+  isp="$(curl -fsS --max-time 3 https://ipapi.co/json 2>/dev/null | jq -r '.country_code + "-" + (.org // "VPS")' 2>/dev/null || echo "VPS")"
+  isp="${isp// /_}"
 
-    # VLESS-Reality 链接
-    local VLESS_URL="vless://${UUID}@${SERVER_IP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${DEFAULT_REALITY_SNI}&fp=chrome&pbk=${PUBLIC_KEY}&type=tcp&headerType=none#${ISP}"
+  sni="${REALITY_SNI:-$DEFAULT_REALITY_SNI}"
 
-    # Hysteria2 链接
-    local HY2_URL="hysteria2://${PASSWORD}@${SERVER_IP}:${HY2_PORT}/?sni=www.nvidia.com&insecure=1&alpn=h3&obfs=none#${ISP}"
+  local VLESS_URL="vless://${UUID}@${server_ip}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${PUBLIC_KEY}&type=tcp&headerType=none#${isp}"
+  local HY2_URL="hysteria2://${PASSWORD}@${server_ip}:${HY2_PORT}/?sni=${sni}&insecure=1&alpn=h3&obfs=none#${isp}"
 
-    # 保存到文件
-    cat > "${CLIENT_DIR}" << EOF
+  cat > "${CLIENT_DIR}" <<EOF
 ===========================================
         Xray + Hysteria2 节点信息
 ===========================================
@@ -644,547 +541,327 @@ ${HY2_URL}
 认证信息:
   UUID: ${UUID}
   Hysteria2 密码: ${PASSWORD}
+  PublicKey: ${PUBLIC_KEY}
 
-Reality 伪装: ${DEFAULT_REALITY_SNI}
+Reality 伪装: ${sni}
 ===========================================
 EOF
 
-    chmod 600 "${CLIENT_DIR}"
-    green "节点链接已生成"
+  chmod 600 "${CLIENT_DIR}"
+  green "节点链接已生成: ${CLIENT_DIR}"
 }
 
-# 显示节点信息
 show_urls() {
-    if [ ! -f "${CLIENT_DIR}" ]; then
-        red "请先安装 Xray + Hysteria2"
-        return 1
-    fi
-
-    clear
-    cat "${CLIENT_DIR}"
-    echo ""
+  [[ -f "${CLIENT_DIR}" ]] || { red "请先安装"; return 1; }
+  clear
+  cat "${CLIENT_DIR}"
+  echo
 }
 
-# =========================
-# 配置修改功能
-# =========================
-
+# ---------- 配置修改 ----------
 change_port() {
-    if [ ! -f "${WORK_DIR}/info.conf" ]; then
-        red "请先安装 Xray + Hysteria2"
-        return 1
-    fi
+  load_info || { red "请先安装"; return 1; }
 
-    source "${WORK_DIR}/info.conf"
+  clear
+  green "=== 修改端口 ==="
+  green "1. VLESS-Reality (当前: ${VLESS_PORT})"
+  green "2. Hysteria2 (当前: ${HY2_PORT})"
+  purple "0. 返回"
+  reading "请选择: " choice
 
-    clear
-    green "=== 修改端口 ===\n"
-    green "1. VLESS-Reality 端口 (当前: ${VLESS_PORT})"
-    green "2. Hysteria2 端口 (当前: ${HY2_PORT})"
-    purple "0. 返回"
+  case "$choice" in
+    1)
+      reading "输入新的 VLESS 端口 (10000-50000): " new_port
+      [[ "$new_port" =~ ^[0-9]+$ ]] || { red "端口无效"; return 1; }
+      (( new_port >= 10000 && new_port <= 50000 )) || { red "端口范围错误"; return 1; }
+      port_in_use "$new_port" && { red "端口已占用"; return 1; }
 
-    reading "请选择: " choice
+      sed -i -E "s/\"port\": [0-9]+/\"port\": ${new_port}/" "${CONFIG_DIR}"
+      sed -i -E "s/^VLESS_PORT=.*/VLESS_PORT=${new_port}/" "${INFO_FILE}"
+      VLESS_PORT="$new_port"
+      allow_port "${VLESS_PORT}/tcp"
+      manage_service xray restart
+      generate_urls
+      green "VLESS 端口已更新: ${VLESS_PORT}"
+      ;;
+    2)
+      reading "输入新的 Hysteria2 端口: " new_port
+      [[ "$new_port" =~ ^[0-9]+$ ]] || { red "端口无效"; return 1; }
+      (( new_port >= 1 && new_port <= 65535 )) || { red "端口范围错误"; return 1; }
+      port_in_use "$new_port" && { red "端口已占用"; return 1; }
 
-    case $choice in
-        1)
-            reading "输入新的 VLESS 端口 (10000-50000): " new_port
-            if [[ ! "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -lt 10000 ] || [ "$new_port" -gt 50000 ]; then
-                red "无效的端口号"
-                return 1
-            fi
-
-            # 更新配置
-            sed -i "s/\"port\": ${VLESS_PORT}/\"port\": ${new_port}/" "${CONFIG_DIR}"
-
-            # 防火墙
-            allow_port ${new_port}/tcp
-
-            # 更新配置文件
-            sed -i "s/VLESS_PORT=.*/VLESS_PORT=${new_port}/" "${WORK_DIR}/info.conf"
-
-            # 重启服务
-            manage_service xray restart
-            VLESS_PORT=$new_port
-            generate_urls
-
-            green "VLESS 端口已更新为: ${new_port}"
-            ;;
-        2)
-            reading "输入新的 Hysteria2 端口: " new_port
-            if [[ ! "$new_port" =~ ^[0-9]+$ ]]; then
-                red "无效的端口号"
-                return 1
-            fi
-
-            # 更新配置
-            sed -i "s/listen: :${HY2_PORT}/listen: :${new_port}/" "${HYSTERIA_DIR}/config.yaml"
-
-            # 防火墙
-            allow_port ${new_port}/udp
-
-            # 更新配置文件
-            sed -i "s/HY2_PORT=.*/HY2_PORT=${new_port}/" "${WORK_DIR}/info.conf"
-
-            # 重启服务
-            manage_service hysteria2 restart
-            HY2_PORT=$new_port
-            generate_urls
-
-            green "Hysteria2 端口已更新为: ${new_port}"
-            ;;
-        0)
-            return
-            ;;
-        *)
-            red "无效的选择"
-            ;;
-    esac
+      sed -i -E "s/^listen: :.*/listen: :${new_port}/" "${HYSTERIA_DIR}/config.yaml"
+      sed -i -E "s/^HY2_PORT=.*/HY2_PORT=${new_port}/" "${INFO_FILE}"
+      HY2_PORT="$new_port"
+      allow_port "${HY2_PORT}/udp"
+      manage_service hysteria2 restart
+      generate_urls
+      green "Hysteria2 端口已更新: ${HY2_PORT}"
+      ;;
+    0) return ;;
+    *) red "无效选择" ;;
+  esac
 }
 
 change_uuid() {
-    if [ ! -f "${WORK_DIR}/info.conf" ]; then
-        red "请先安装 Xray + Hysteria2"
-        return 1
-    fi
+  load_info || { red "请先安装"; return 1; }
+  clear
+  green "=== 修改认证信息 ==="
 
-    source "${WORK_DIR}/info.conf"
+  local c1 c2
+  reading "生成新的 UUID? (y/n): " c1
+  reading "生成新的 Hysteria2 密码? (y/n): " c2
 
-    clear
-    green "=== 修改认证信息 ===\n"
+  [[ "$c1" == "y" ]] && UUID="$(generate_uuid)"
+  [[ "$c2" == "y" ]] && PASSWORD="$(generate_password)"
 
-    reading "是否生成新的 UUID? (y/n): " new_uuid_choice
-    if [ "$new_uuid_choice" == "y" ]; then
-        UUID=$(generate_uuid)
-        green "新 UUID: ${UUID}"
-    fi
+  sed -i -E "s/\"id\": \"[^\"]+\"/\"id\": \"${UUID}\"/" "${CONFIG_DIR}"
+  sed -i -E "s/^  password: \".*\"/  password: \"${PASSWORD}\"/" "${HYSTERIA_DIR}/config.yaml"
+  sed -i -E "s/^UUID=.*/UUID=${UUID}/" "${INFO_FILE}"
+  sed -i -E "s/^PASSWORD=.*/PASSWORD=${PASSWORD}/" "${INFO_FILE}"
 
-    reading "是否生成新的 Hysteria2 密码? (y/n): " new_pwd_choice
-    if [ "$new_pwd_choice" == "y" ]; then
-        PASSWORD=$(generate_password)
-        green "新密码: ${PASSWORD}"
-    fi
+  manage_service xray restart
+  manage_service hysteria2 restart
+  generate_urls
 
-    # 更新 Xray 配置
-    sed -i "s/\"id\": \"[^\"]*\"/\"id\": \"${UUID}\"/" "${CONFIG_DIR}"
-
-    # 更新 Hysteria2 配置
-    sed -i "s/\"${PASSWORD}\": \"admin\"/\"${PASSWORD}\": \"admin\"/" "${HYSTERIA_DIR}/config.yaml"
-
-    # 更新配置文件
-    sed -i "s/UUID=.*/UUID=${UUID}/" "${WORK_DIR}/info.conf"
-    sed -i "s/PASSWORD=.*/PASSWORD=${PASSWORD}/" "${WORK_DIR}/info.conf"
-
-    # 重启服务
-    manage_service xray restart
-    manage_service hysteria2 restart
-
-    # 重新生成链接
-    generate_urls
-
-    green "\n认证信息已更新"
-    green "UUID: ${UUID}"
-    green "Hysteria2 密码: ${PASSWORD}"
+  green "认证信息已更新"
+  green "UUID: ${UUID}"
+  green "密码: ${PASSWORD}"
 }
 
 change_sni() {
-    if [ ! -f "${WORK_DIR}/info.conf" ]; then
-        red "请先安装 Xray + Hysteria2"
-        return 1
-    fi
+  load_info || { red "请先安装"; return 1; }
 
-    source "${WORK_DIR}/info.conf"
+  clear
+  green "=== 修改 Reality 伪装域名 ==="
+  green "1. www.microsoft.com"
+  green "2. www.apple.com"
+  green "3. www.nvidia.com"
+  green "4. www.intel.com"
+  green "5. www.adobe.com"
+  green "6. 自定义"
+  purple "0. 返回"
+  reading "请选择: " choice
 
-    clear
-    green "=== 修改 Reality 伪装域名 ===\n"
-    green "常用伪装域名:"
-    green "1. www.microsoft.com"
-    green "2. www.apple.com"
-    green "3. www.nvidia.com (当前)"
-    green "4. www.intel.com"
-    green "5. www.adobe.com"
-    green "6. 自定义"
-    purple "0. 返回"
+  local new_sni output pair new_private new_public
+  case "$choice" in
+    1) new_sni="www.microsoft.com" ;;
+    2) new_sni="www.apple.com" ;;
+    3) new_sni="www.nvidia.com" ;;
+    4) new_sni="www.intel.com" ;;
+    5) new_sni="www.adobe.com" ;;
+    6) reading "输入自定义域名: " new_sni ;;
+    0) return ;;
+    *) red "无效选择"; return 1 ;;
+  esac
 
-    reading "\n请选择: " choice
+  output="$("${XRAY_DIR}/xray" x25519 2>/dev/null || true)"
+  pair="$(extract_x25519_keys "$output" || true)"
+  [[ -n "$pair" ]] || { red "重新生成密钥失败"; return 1; }
+  new_private="${pair%%|*}"
+  new_public="${pair##*|}"
 
-    case $choice in
-        1) new_sni="www.microsoft.com" ;;
-        2) new_sni="www.apple.com" ;;
-        3) new_sni="www.nvidia.com" ;;
-        4) new_sni="www.intel.com" ;;
-        5) new_sni="www.adobe.com" ;;
-        6)
-            reading "输入自定义域名: " new_sni
-            ;;
-        0)
-            return
-            ;;
-        *)
-            red "无效的选择"
-            return
-            ;;
-    esac
+  sed -i -E "s/\"dest\": \"[^\"]+\"/\"dest\": \"${new_sni}:443\"/" "${CONFIG_DIR}"
+  sed -i -E "s/\"serverNames\": \[[^]]*\]/\"serverNames\": [\"${new_sni}\"]/" "${CONFIG_DIR}"
+  sed -i -E "s/\"privateKey\": \"[^\"]+\"/\"privateKey\": \"${new_private}\"/" "${CONFIG_DIR}"
 
-    # 更新 Xray 配置
-    sed -i "s/\"dest\": \"[^\"]*\"/\"dest\": \"${new_sni}:443\"/" "${CONFIG_DIR}"
-    sed -i "s/\"serverNames\": \[[^]]*\]/\"serverNames\": [\"${new_sni}\"]/" "${CONFIG_DIR}"
+  sed -i -E "s/^    url: .*/    url: https:\/\/${new_sni}/" "${HYSTERIA_DIR}/config.yaml"
 
-    # 重新生成 Reality 密钥对
-    output=$(${XRAY_DIR}/xray x25519)
-    new_private_key=$(echo "${output}" | awk '/Private key:/ {print $3}')
-    new_public_key=$(echo "${output}" | awk '/Public key:/ {print $3}')
+  sed -i -E "s/^REALITY_SNI=.*/REALITY_SNI=${new_sni}/" "${INFO_FILE}"
+  sed -i -E "s/^PRIVATE_KEY=.*/PRIVATE_KEY=${new_private}/" "${INFO_FILE}"
+  sed -i -E "s/^PUBLIC_KEY=.*/PUBLIC_KEY=${new_public}/" "${INFO_FILE}"
 
-    sed -i "s/\"privateKey\": \"[^\"]*\"/\"privateKey\": \"${new_private_key}\"/" "${CONFIG_DIR}"
-
-    # 更新配置文件
-    sed -i "s/REALITY_SNI=.*/REALITY_SNI=${new_sni}/" "${WORK_DIR}/info.conf"
-    sed -i "s/PUBLIC_KEY=.*/PUBLIC_KEY=${new_public_key}/" "${WORK_DIR}/info.conf"
-    sed -i "s/PRIVATE_KEY=.*/PRIVATE_KEY=${new_private_key}/" "${WORK_DIR}/info.conf"
-
-    # 重启服务
-    manage_service xray restart
-
-    # 重新生成链接
-    DEFAULT_REALITY_SNI=$new_sni
-    generate_urls
-
-    green "Reality 伪装域名已更新为: ${new_sni}"
+  manage_service xray restart
+  manage_service hysteria2 restart
+  generate_urls
+  green "SNI 已更新: ${new_sni}"
 }
 
-# =========================
-# 主安装流程
-# =========================
+# ---------- 快捷指令 ----------
+create_shortcut() {
+  if [[ -n "$SCRIPT_URL" ]]; then
+    cat > /usr/local/bin/xr <<EOF
+#!/usr/bin/env bash
+bash <(curl -fsSL "${SCRIPT_URL}") "\$@"
+EOF
+  else
+    cat > /usr/local/bin/xr <<'EOF'
+#!/usr/bin/env bash
+echo "请先设置 SCRIPT_URL 后重新安装，或直接运行原脚本文件。"
+exit 1
+EOF
+  fi
+  chmod +x /usr/local/bin/xr
+  green "快捷命令 xr 已创建"
+}
 
+# ---------- 主流程 ----------
 install_all() {
-    clear
-    purple "开始安装 Xray + Hysteria2..."
+  clear
+  purple "开始安装 Xray + Hysteria2..."
 
-    # 检查系统
-    local SYSTEM=$(detect_system)
-    if [ "$SYSTEM" == "unknown" ]; then
-        red "不支持的系统"
-        exit 1
-    fi
+  local system
+  system="$(detect_system)"
+  [[ "$system" != "unknown" ]] || die "不支持的系统"
+  green "系统: ${system}"
 
-    green "检测到系统: ${SYSTEM}"
+  manage_packages install curl jq unzip openssl iproute2
 
-    # 安装依赖
-    purple "安装依赖包..."
-    manage_packages install curl jq unzip openssl
+  port_in_use "$VLESS_PORT" && die "VLESS 端口已占用: $VLESS_PORT"
+  port_in_use "$HY2_PORT" && die "Hysteria2 端口已占用: $HY2_PORT"
 
-    # 安装 Xray
-    install_xray
+  install_xray
+  install_hysteria2
+  generate_config
+  create_xray_service
+  create_hysteria2_service
+  setup_time_sync
 
-    # 安装 Hysteria2
-    install_hysteria2
+  purple "配置防火墙..."
+  allow_port "${VLESS_PORT}/tcp" "${HY2_PORT}/udp"
 
-    # 生成配置
-    generate_config
+  purple "启动服务..."
+  manage_service xray start || die "xray 启动失败"
+  manage_service hysteria2 start || die "hysteria2 启动失败"
+  sleep 2
 
-    # 创建服务
-    create_xray_service
-    create_hysteria2_service
+  generate_urls
+  create_shortcut
 
-    # 配置时间同步
-    setup_time_sync
-
-    # 放行端口
-    purple "配置防火墙..."
-    allow_port ${VLESS_PORT}/tcp
-    allow_port ${HY2_PORT}/udp
-
-    # 启动服务
-    purple "启动服务..."
-    manage_service xray start
-    manage_service hysteria2 start
-
-    # 等待服务启动
-    sleep 3
-
-    # 生成节点链接
-    generate_urls
-
-    # 显示信息
-    clear
-    green "=== 安装完成 ===\n"
-    show_urls
-
-    # 创建快捷指令
-    create_shortcut
+  clear
+  green "=== 安装完成 ==="
+  show_urls
 }
-
-# =========================
-# 卸载
-# =========================
 
 uninstall_all() {
-    reading "确定要卸载 Xray + Hysteria2? (y/n): " confirm
-    if [ "$confirm" != "y" ]; then
-        purple "已取消"
-        return
-    fi
+  reading "确定要卸载 Xray + Hysteria2? (y/n): " c
+  [[ "$c" == "y" ]] || { yellow "已取消"; return; }
 
-    yellow "正在卸载..."
+  yellow "正在卸载..."
+  manage_service xray stop >/dev/null 2>&1 || true
+  manage_service hysteria2 stop >/dev/null 2>&1 || true
 
-    # 停止服务
-    manage_service xray stop
-    manage_service hysteria2 stop
+  local system
+  system="$(detect_system)"
+  if [[ "$system" == "alpine" ]]; then
+    rc-update del xray default >/dev/null 2>&1 || true
+    rc-update del hysteria2 default >/dev/null 2>&1 || true
+  else
+    systemctl disable xray hysteria2 >/dev/null 2>&1 || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
 
-    # 禁用服务
-    local SYSTEM=$(detect_system)
-    if [ "$SYSTEM" == "alpine" ]; then
-        rc-update del xray default
-        rc-update del hysteria2 default
-    else
-        systemctl disable xray
-        systemctl disable hysteria2
-    fi
-
-    # 删除服务文件
-    rm -f /etc/systemd/system/xray.service
-    rm -f /etc/systemd/system/hysteria2.service
-    rm -f /etc/init.d/xray
-    rm -f /etc/init.d/hysteria2
-
-    # 重新加载 systemd
-    if [ "$SYSTEM" != "alpine" ]; then
-        systemctl daemon-reload
-    fi
-
-    # 删除文件
-    rm -rf "${XRAY_DIR}"
-    rm -rf "${HYSTERIA_DIR}"
-    rm -rf "${WORK_DIR}"
-
-    # 删除快捷指令
-    rm -f /usr/local/bin/xr
-
-    green "卸载完成"
+  rm -f /etc/systemd/system/xray.service /etc/systemd/system/hysteria2.service
+  rm -f /etc/init.d/xray /etc/init.d/hysteria2
+  rm -rf "$XRAY_DIR" "$HYSTERIA_DIR" "$WORK_DIR"
+  rm -f /usr/local/bin/xr
+  green "卸载完成"
 }
 
-# =========================
-# 快捷指令
-# =========================
-
-create_shortcut() {
-    cat > /usr/local/bin/xr << 'EOF'
-#!/bin/bash
-bash <(curl -Ls https://raw.githubusercontent.com/AS216211/xr/main/xray-hysteria2.sh) "$1"
-EOF
-
-    # 或本地调用
-    cat > /usr/local/bin/xr << EOF
-#!/bin/bash
-bash $(readlink -f "$0") "\$@"
-EOF
-
-    chmod +x /usr/local/bin/xr
-
-    if [ -s /usr/local/bin/xr ]; then
-        green "\n快捷指令 'xr' 创建成功"
-        green "使用方法: xr [选项]"
-    fi
-}
-
-# =========================
-# 服务管理菜单
-# =========================
-
+# ---------- 菜单 ----------
 service_menu() {
-    while true; do
-        clear
-        green "=== 服务管理 ===\n"
-
-        local xray_status=$(manage_service xray status)
-        local hy2_status=$(manage_service hysteria2 status)
-
-        green "Xray 状态: ${xray_status}"
-        green "Hysteria2 状态: ${hy2_status}\n"
-
-        green "1. 启动所有服务"
-        green "2. 停止所有服务"
-        green "3. 重启所有服务"
-        purple "0. 返回主菜单"
-
-        reading "请选择: " choice
-
-        case $choice in
-            1)
-                manage_service xray start
-                manage_service hysteria2 start
-                green "服务已启动"
-                ;;
-            2)
-                manage_service xray stop
-                manage_service hysteria2 stop
-                green "服务已停止"
-                ;;
-            3)
-                manage_service xray restart
-                manage_service hysteria2 restart
-                green "服务已重启"
-                ;;
-            0)
-                return
-                ;;
-            *)
-                red "无效的选择"
-                ;;
-        esac
-
-        reading "\n按回车继续..."
-    done
+  while true; do
+    clear
+    green "=== 服务管理 ==="
+    green "Xray: $(manage_service xray status)"
+    green "Hysteria2: $(manage_service hysteria2 status)"
+    echo "1) 启动  2) 停止  3) 重启  0) 返回"
+    reading "请选择: " ch
+    case "$ch" in
+      1) manage_service xray start; manage_service hysteria2 start ;;
+      2) manage_service xray stop; manage_service hysteria2 stop ;;
+      3) manage_service xray restart; manage_service hysteria2 restart ;;
+      0) return ;;
+      *) red "无效选择" ;;
+    esac
+    reading "回车继续..." _
+  done
 }
-
-# =========================
-# 配置管理菜单
-# =========================
 
 config_menu() {
-    while true; do
-        clear
-        green "=== 配置管理 ===\n"
-        green "1. 修改端口"
-        green "2. 修改认证信息 (UUID/密码)"
-        green "3. 修改 Reality 伪装域名"
-        green "4. 查看节点链接"
-        purple "0. 返回主菜单"
-
-        reading "请选择: " choice
-
-        case $choice in
-            1)
-                change_port
-                reading "\n按回车继续..."
-                ;;
-            2)
-                change_uuid
-                reading "\n按回车继续..."
-                ;;
-            3)
-                change_sni
-                reading "\n按回车继续..."
-                ;;
-            4)
-                show_urls
-                reading "\n按回车继续..."
-                ;;
-            0)
-                return
-                ;;
-            *)
-                red "无效的选择"
-                reading "\n按回车继续..."
-                ;;
-        esac
-    done
+  while true; do
+    clear
+    green "=== 配置管理 ==="
+    echo "1) 修改端口"
+    echo "2) 修改认证信息"
+    echo "3) 修改 SNI"
+    echo "4) 查看节点链接"
+    echo "0) 返回"
+    reading "请选择: " ch
+    case "$ch" in
+      1) change_port ;;
+      2) change_uuid ;;
+      3) change_sni ;;
+      4) show_urls ;;
+      0) return ;;
+      *) red "无效选择" ;;
+    esac
+    reading "回车继续..." _
+  done
 }
-
-# =========================
-# 主菜单
-# =========================
 
 main_menu() {
-    while true; do
-        clear
-        echo ""
-        purple "╔═══════════════════════════════════════╗"
-        purple "║   Xray + Hysteria2 管理脚本           ║"
-        purple "╚═══════════════════════════════════════╝"
-        echo ""
+  while true; do
+    clear
+    purple "╔═══════════════════════════════════════╗"
+    purple "║    Xray + Hysteria2 管理脚本(增强)    ║"
+    purple "╚═══════════════════════════════════════╝"
+    echo
 
-        # 检查安装状态
-        local xray_installed=false
-        local hy2_installed=false
+    local xray_installed=false hy2_installed=false
+    [[ -x "${XRAY_DIR}/xray" ]] && xray_installed=true
+    [[ -x "${HYSTERIA_DIR}/hysteria2" ]] && hy2_installed=true
 
-        [ -f "${XRAY_DIR}/xray" ] && xray_installed=true
-        [ -f "${HYSTERIA_DIR}/hysteria2" ] && hy2_installed=true
+    if [[ "$xray_installed" == true && "$hy2_installed" == true ]]; then
+      sky "Xray: $(manage_service xray status)"
+      sky "Hysteria2: $(manage_service hysteria2 status)"
+      echo
+    fi
 
-        if [ "$xray_installed" = true ] && [ "$hy2_installed" = true ]; then
-            local xray_status=$(manage_service xray status)
-            local hy2_status=$(manage_service hysteria2 status)
+    echo "1) 安装 Xray + Hysteria2"
+    echo "2) 卸载 Xray + Hysteria2"
+    echo "3) 服务管理"
+    echo "4) 配置管理"
+    echo "5) 查看节点链接"
+    echo "6) 查看服务器 IP"
+    echo "0) 退出"
 
-            purple "--- 服务状态 ---"
-            purple "Xray: ${xray_status}"
-            purple "Hysteria2: ${hy2_status}"
-            echo ""
+    reading "请选择 (0-6): " choice
+    case "$choice" in
+      1)
+        if [[ "$xray_installed" == true || "$hy2_installed" == true ]]; then
+          yellow "检测到已安装，请先卸载或手动清理"
+        else
+          install_all
         fi
-
-        green "1. 安装 Xray + Hysteria2"
-        green "2. 卸载 Xray + Hysteria2"
-        echo "==================="
-        green "3. 服务管理"
-        green "4. 配置管理"
-        echo "==================="
-        green "5. 查看节点链接"
-        green "6. 查看 IP 地址"
-        echo "==================="
-        red "0. 退出"
-
-        reading "请选择 (0-6): " choice
-
-        case $choice in
-            1)
-                if [ "$xray_installed" = true ] || [ "$hy2_installed" = true ]; then
-                    yellow "Xray 或 Hysteria2 已经安装"
-                    reading "按回车继续..."
-                else
-                    install_all
-                    reading "\n按回车返回主菜单..."
-                fi
-                ;;
-            2)
-                uninstall_all
-                reading "\n按回车继续..."
-                ;;
-            3)
-                if [ "$xray_installed" = false ] || [ "$hy2_installed" = false ]; then
-                    yellow "请先安装 Xray + Hysteria2"
-                    reading "按回车继续..."
-                else
-                    service_menu
-                fi
-                ;;
-            4)
-                if [ "$xray_installed" = false ] || [ "$hy2_installed" = false ]; then
-                    yellow "请先安装 Xray + Hysteria2"
-                    reading "按回车继续..."
-                else
-                    config_menu
-                fi
-                ;;
-            5)
-                if [ "$xray_installed" = false ] || [ "$hy2_installed" = false ]; then
-                    yellow "请先安装 Xray + Hysteria2"
-                else
-                    show_urls
-                fi
-                reading "\n按回车继续..."
-                ;;
-            6)
-                purple "服务器 IP: $(get_realip)"
-                reading "\n按回车继续..."
-                ;;
-            0)
-                purple "退出脚本"
-                exit 0
-                ;;
-            *)
-                red "无效的选择"
-                reading "\n按回车继续..."
-                ;;
-        esac
-    done
+        reading "回车继续..." _
+        ;;
+      2) uninstall_all; reading "回车继续..." _ ;;
+      3)
+        if [[ "$xray_installed" == true && "$hy2_installed" == true ]]; then
+          service_menu
+        else
+          yellow "请先安装"
+          reading "回车继续..." _
+        fi
+        ;;
+      4)
+        if [[ "$xray_installed" == true && "$hy2_installed" == true ]]; then
+          config_menu
+        else
+          yellow "请先安装"
+          reading "回车继续..." _
+        fi
+        ;;
+      5) show_urls; reading "回车继续..." _ ;;
+      6) purple "服务器 IP: $(get_realip)"; reading "回车继续..." _ ;;
+      0) purple "退出"; exit 0 ;;
+      *) red "无效选择"; reading "回车继续..." _ ;;
+    esac
+  done
 }
 
-# =========================
-# 脚本入口
-# =========================
-
+# ---------- 入口 ----------
 check_root
-
-# 捕获 Ctrl+C
-trap 'echo -e "\n${red}已取消操作${re}"; exit' INT
-
-# 启动主菜单
+trap 'echo; red "已取消操作"; exit 130' INT
 main_menu
