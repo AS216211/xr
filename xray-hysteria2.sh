@@ -187,16 +187,26 @@ generate_password() { tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 24; }
 
 extract_x25519_keys() {
   local out="$1" pri pub
-  pri="$(echo "$out" | sed -nE 's/.*Private[[:space:]_]?Key:[[:space:]]*([A-Za-z0-9+\/=_-]+).*/\1/p' | head -n1)"
-  pub="$(echo "$out" | sed -nE 's/.*Public[[:space:]_]?Key:[[:space:]]*([A-Za-z0-9+\/=_-]+).*/\1/p' | head -n1)"
 
+  # PrivateKey: xxxx
+  pri="$(echo "$out" | sed -nE 's/.*PrivateKey:[[:space:]]*([A-Za-z0-9+\/=_-]+).*/\1/p' | head -n1)"
+  # PublicKey: xxxx
+  pub="$(echo "$out" | sed -nE 's/.*PublicKey:[[:space:]]*([A-Za-z0-9+\/=_-]+).*/\1/p' | head -n1)"
+
+  # 兼容：Password (PublicKey): xxxx
+  [[ -z "$pub" ]] && pub="$(echo "$out" | sed -nE 's/.*Password[[:space:]]*\(PublicKey\):[[:space:]]*([A-Za-z0-9+\/=_-]+).*/\1/p' | head -n1)"
+
+  # 兼容旧格式：Private key / Public key
   [[ -z "$pri" ]] && pri="$(echo "$out" | awk '/Private key:/ {print $3}' | head -n1)"
   [[ -z "$pub" ]] && pub="$(echo "$out" | awk '/Public key:/ {print $3}' | head -n1)"
-  [[ -z "$pub" ]] && pub="$(echo "$out" | awk '/Password:/ {print $2}' | head -n1)"
+
+  # 兜底：只要包含 Password: 也尝试取第二列
+  [[ -z "$pub" ]] && pub="$(echo "$out" | awk '/Password/ {print $NF}' | head -n1)"
 
   [[ -n "$pri" && -n "$pub" ]] || return 1
   echo "${pri}|${pub}"
 }
+
 
 # ---------- 安装 ----------
 install_xray() {
