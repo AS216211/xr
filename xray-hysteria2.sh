@@ -969,7 +969,7 @@ uninstall_all() {
 create_shortcut() {
     cat > /usr/local/bin/xr << 'EOF'
 #!/bin/bash
-bash <(curl -Ls https://raw.githubusercontent.com/your-repo/xray-hysteria2/main/xray-hysteria2.sh) "$1"
+bash <(curl -Ls https://raw.githubusercontent.com/AS216211/xr/main/xray-hysteria2.sh) "$1"
 EOF
 
     # 或本地调用
