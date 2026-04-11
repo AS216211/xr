@@ -1,6 +1,6 @@
 alpine:
 
-```md
+```
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/AS216211/xr/main/alpine-vless-reality-auto.sh)
 ```
